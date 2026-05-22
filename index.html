@@ -83,8 +83,9 @@
       font-size: 10px; line-height: 1.65;
       transition: border-color .15s, background .15s;
     }
-    .tab-row:hover   { background: rgba(255,255,255,0.04); border-color: var(--border); }
-    .tab-row.is-me   { border-color: rgba(74,158,255,.25); background: rgba(74,158,255,.05); }
+    .tab-row:hover      { background: rgba(255,255,255,0.04); border-color: var(--border); }
+    .tab-row.is-me      { border-color: rgba(74,158,255,.25); background: rgba(74,158,255,.05); }
+    .tab-row.is-focused { border-color: rgba(255,255,255,.15); background: rgba(255,255,255,.04); }
 
     .tab-row-head { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; }
 
@@ -171,10 +172,11 @@ function rrect(ctx, x, y, w, h, r) {
 // ── TabTracker ────────────────────────────────────────────────────────────
 class TabTracker {
   constructor() {
-    this.id  = crypto.randomUUID();
-    this.tabs = {};
+    this.id       = crypto.randomUUID();
+    this.tabs     = {};
     this.colorMap = { [this.id]: 0 };
     this.colorSeq = 1;
+    this.focusedId = this.id;   // shared across all tabs: who is currently focused
     this.ch = new BroadcastChannel(CHANNEL);
 
     this.ch.onmessage = ({ data: { type, id, state } }) => {
@@ -182,22 +184,37 @@ class TabTracker {
         this.tabs[id] = state;
         if (!(id in this.colorMap)) this.colorMap[id] = this.colorSeq++;
       }
-      if (type === 'remove') delete this.tabs[id];
-      if (type === 'sync')   this.publish();
+      if (type === 'remove') {
+        delete this.tabs[id];
+        if (this.focusedId === id) this.focusedId = this.id;
+      }
+      if (type === 'focus')  this.focusedId = id;
+      if (type === 'sync')   { this.publish(); this.broadcastFocus(); }
       this.draw();
     };
 
     window.addEventListener('beforeunload', () =>
       this.ch.postMessage({ type: 'remove', id: this.id }));
 
-    ['resize', 'focus', 'blur', 'mousemove'].forEach(ev =>
+    window.addEventListener('focus', () => {
+      this.focusedId = this.id;
+      this.broadcastFocus();
+      this.publish();
+    }, { passive: true });
+
+    ['resize', 'blur', 'mousemove'].forEach(ev =>
       window.addEventListener(ev, () => this.publish(), { passive: true }));
 
     this.tabs[this.id] = this.snapshot();
     this.publish();
+    this.broadcastFocus();
     this.ch.postMessage({ type: 'sync' });
 
     setInterval(() => { this.publish(); this.prune(); this.draw(); }, TICK_MS);
+  }
+
+  broadcastFocus() {
+    this.ch.postMessage({ type: 'focus', id: this.focusedId });
   }
 
   snapshot() {
@@ -253,8 +270,9 @@ class TabTracker {
       centers[id] = { x: (tl.x + br.x) / 2, y: (tl.y + br.y) / 2 };
     });
 
-    const myId  = this.id;
-    const me    = centers[myId];
+    const myId      = this.id;
+    const focusedId = this.focusedId in this.tabs ? this.focusedId : ids[0];
+    const hub       = centers[focusedId];
 
     // Grid
     ctx.strokeStyle = 'rgba(255,255,255,0.03)';
@@ -263,18 +281,18 @@ class TabTracker {
     for (let x = 0; x < W; x += step) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
     for (let y = 0; y < H; y += step) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
 
-    // Connection lines (ME → each other tab)
-    if (me) {
+    // Connection lines (focused tab → every other tab)
+    if (hub) {
       ids.forEach(id => {
-        if (id === myId) return;
+        if (id === focusedId) return;
         const c   = centers[id];
         const col = this.color(id);
-        const g   = ctx.createLinearGradient(me.x, me.y, c.x, c.y);
-        g.addColorStop(0, rgba(this.color(myId), .5));
+        const g   = ctx.createLinearGradient(hub.x, hub.y, c.x, c.y);
+        g.addColorStop(0, rgba(this.color(focusedId), .5));
         g.addColorStop(1, rgba(col, .5));
 
         ctx.beginPath();
-        ctx.moveTo(me.x, me.y);
+        ctx.moveTo(hub.x, hub.y);
         ctx.lineTo(c.x, c.y);
         ctx.strokeStyle = g;
         ctx.lineWidth   = 1.5;
@@ -282,10 +300,10 @@ class TabTracker {
         ctx.stroke();
 
         // Midpoint tick
-        const mx  = (me.x + c.x) / 2, my = (me.y + c.y) / 2;
-        const dx  = c.x - me.x,        dy = c.y - me.y;
+        const mx  = (hub.x + c.x) / 2, my = (hub.y + c.y) / 2;
+        const dx  = c.x - hub.x,        dy = c.y - hub.y;
         const len = Math.hypot(dx, dy) || 1;
-        const px  = -dy / len * 6,     py = dx / len * 6;
+        const px  = -dy / len * 6,      py = dx / len * 6;
         ctx.beginPath();
         ctx.moveTo(mx - px, my - py);
         ctx.lineTo(mx + px, my + py);
@@ -297,36 +315,36 @@ class TabTracker {
 
     // Tab rectangles
     ids.forEach(id => {
-      const r    = rects[id];
-      const col  = this.color(id);
-      const isMe = id === myId;
+      const r         = rects[id];
+      const col       = this.color(id);
+      const isFocused = id === focusedId;
+      const isMe      = id === myId;
 
-      ctx.fillStyle   = rgba(col, isMe ? .07 : .04);
-      ctx.strokeStyle = rgba(col, isMe ? .6  : .35);
-      ctx.lineWidth   = isMe ? 1.5 : 1;
-      ctx.setLineDash(isMe ? [] : [4, 3]);
+      ctx.fillStyle   = rgba(col, isFocused ? .09 : .04);
+      ctx.strokeStyle = rgba(col, isFocused ? .7  : .3);
+      ctx.lineWidth   = isFocused ? 1.5 : 1;
+      ctx.setLineDash(isFocused ? [] : [4, 3]);
       rrect(ctx, r.x, r.y, r.w, r.h, 6);
       ctx.fill(); ctx.stroke();
       ctx.setLineDash([]);
 
       // Label badge
-      const label = this.label(id);
-      const bfont = '500 10px JetBrains Mono, monospace';
-      ctx.font     = bfont;
+      const label = this.label(id) + (isMe ? ' (you)' : '');
+      ctx.font     = '500 10px JetBrains Mono, monospace';
       const bw     = ctx.measureText(label).width + 10;
       const bh     = 18;
       ctx.fillStyle = rgba(col, .85);
       rrect(ctx, r.x + 6, r.y + 6, bw, bh, 4);
       ctx.fill();
-      ctx.fillStyle   = '#fff';
+      ctx.fillStyle    = '#fff';
       ctx.textBaseline = 'middle';
       ctx.fillText(label, r.x + 11, r.y + 6 + bh / 2);
 
       // Size text
       const t = this.tabs[id];
-      ctx.fillStyle   = rgba(col, .55);
-      ctx.font        = '400 9px JetBrains Mono, monospace';
-      ctx.textAlign   = 'right';
+      ctx.fillStyle    = rgba(col, .55);
+      ctx.font         = '400 9px JetBrains Mono, monospace';
+      ctx.textAlign    = 'right';
       ctx.textBaseline = 'bottom';
       ctx.fillText(`${t.w}×${t.h}`, r.x + r.w - 6, r.y + r.h - 5);
       ctx.textAlign = 'left';
@@ -334,25 +352,25 @@ class TabTracker {
 
     // Center dots
     ids.forEach(id => {
-      const c    = centers[id];
-      const col  = this.color(id);
-      const isMe = id === myId;
+      const c         = centers[id];
+      const col       = this.color(id);
+      const isFocused = id === focusedId;
 
-      if (isMe) {
+      if (isFocused) {
         ctx.beginPath();
         ctx.arc(c.x, c.y, 14, 0, TAU);
-        ctx.fillStyle = rgba(col, .08);
+        ctx.fillStyle = rgba(col, .1);
         ctx.fill();
       }
 
       ctx.beginPath();
-      ctx.arc(c.x, c.y, isMe ? 9 : 7, 0, TAU);
+      ctx.arc(c.x, c.y, isFocused ? 9 : 7, 0, TAU);
       ctx.strokeStyle = rgba(col, .4);
-      ctx.lineWidth   = isMe ? 1.5 : 1;
+      ctx.lineWidth   = isFocused ? 1.5 : 1;
       ctx.stroke();
 
       ctx.beginPath();
-      ctx.arc(c.x, c.y, isMe ? 5 : 4, 0, TAU);
+      ctx.arc(c.x, c.y, isFocused ? 5 : 4, 0, TAU);
       ctx.fillStyle = col;
       ctx.fill();
     });
@@ -362,13 +380,15 @@ class TabTracker {
     document.getElementById('ts').textContent    = new Date().toTimeString().slice(0, 8);
 
     document.getElementById('tab-list').innerHTML = ids.map(id => {
-      const t   = this.tabs[id];
-      const isMe = id === myId;
-      const col = this.color(id);
-      return `<div class="tab-row${isMe ? ' is-me' : ''}">
+      const t         = this.tabs[id];
+      const isMe      = id === myId;
+      const isFocused = id === focusedId;
+      const col       = this.color(id);
+      const suffix    = isMe ? ' (you)' : isFocused ? ' (focused)' : '';
+      return `<div class="tab-row${isMe ? ' is-me' : ''}${isFocused && !isMe ? ' is-focused' : ''}">
         <div class="tab-row-head">
           <div class="dot" style="background:${col};box-shadow:0 0 5px ${col}80"></div>
-          <span class="tab-name">${this.label(id)}</span>
+          <span class="tab-name">${this.label(id)}${suffix}</span>
         </div>
         <div class="tab-meta">
           pos (${t.x}, ${t.y}) &nbsp;${t.w}×${t.h}<br>
